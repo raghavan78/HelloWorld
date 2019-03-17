@@ -1,1 +1,1 @@
-print ("Hellow world in python")
+print ("world in python")
