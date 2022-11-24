@@ -55,16 +55,17 @@ jobs:
             for IP in $(host runner.circleci.com | awk '{ print $4; }')
               do
                 vpn_command+=(--route $IP 255.255.255.255 net_gateway)
-                echo $IP
+                echo host ip $IP
             done
 
             for SYS_RES_DNS in $(systemd-resolve --status | grep 'DNS Servers'|awk '{print $3}')
               do
                 vpn_command+=(--route $SYS_RES_DNS 255.255.255.255 net_gateway)
-                echo $SYS_RES_DNS
+                echo sys res $SYS_RES_DNS
             done
 
             "${vpn_command[@]}" > /tmp/openvpn.log
+            cat /tmp/openvpn.log
 
       - run:
           name: Wait for the connection to be established and check IP
@@ -75,7 +76,6 @@ jobs:
               echo "Attempting to connect to VPN server..."
               sleep 1;
             done
-            telnet 10.20.3.87 22
 
             if [ ! -f /tmp/openvpn.log ] || (! grep -iq "Initialization Sequence Completed" /tmp/openvpn.log); then
               printf "\nUnable to establish connection within the allocated time ---> Giving up.\n"
