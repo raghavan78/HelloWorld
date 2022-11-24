@@ -11,66 +11,76 @@ jobs:
       - run:
           name: Install OpenVPN
           command: |
-            sudo apt update && sudo apt install apt-transport-https
-            sudo wget https://swupdate.openvpn.net/repos/openvpn-repo-pkg-key.pub
-            sudo apt-key add openvpn-repo-pkg-key.pub
-            
-            sudo wget -O /etc/apt/sources.list.d/openvpn3.list https://swupdate.openvpn.net/community/openvpn3/repos/openvpn3-$(sed 's/UBUNTU_CODENAME=//;t;d' /etc/os-release).list
-            sudo apt update && sudo apt install openvpn3 openvpn-systemd-resolved
+            sudo apt-get update
+            sudo apt-get install openvpn openvpn-systemd-resolved
 
       - run:
           name: Check IP before VPN connection
           command: |
             ip a
             echo "Public IP before VPN connection is $(curl checkip.amazonaws.com)"
-
       - run:
           name: VPN Setup
           background: true
           command: |
             echo $VPN_CLIENT_CONFIG | base64 --decode > /tmp/config.ovpn
 
-            ET_phone_home=$(ss -Hnto state established '( sport = :ssh )' | head -n1 | awk '{ split($4, a, ":"); print a[1] }')
-            ## In case you're using an image with Ubuntu < 20.04, replace the above line with:
-            ## ET_phone_home=$(ss -an | grep 'ESTAB .*:22' | head -n1 | awk '{ split($6, a, ":"); print a[1] }')
-            echo $ET_phone_home
-            
-            if [ -n "$ET_phone_home" ]; then
-              echo "route $ET_phone_home 255.255.255.255 net_gateway" >> /tmp/config.ovpn
+            if grep -q auth-user-pass /tmp/config.ovpn; then
+              if [ -z "${VPN_USER:-}" ] || [ -z "${VPN_PASSWORD:-}" ]; then
+                echo "Your VPN client is configured with a user-locked profile. Make sure to set the VPN_USER and VPN_PASSWORD environment variables"
+                exit 1
+              else
+                printf "$VPN_USER\\n$VPN_PASSWORD" > /tmp/vpn.login
+              fi
             fi
-            
-            echo "route 169.254.0.0 255.255.0.0 net_gateway" >> /tmp/config.ovpn
-            
-            for SYS_RES_DNS in $(systemd-resolve --status | grep 'DNS Servers'|awk '{print $3}')
-              do
-                echo "route $SYS_RES_DNS 255.255.0.0 net_gateway" >> /tmp/config.ovpn
-                echo $SYS_RES_DNS
-            done
+
+            vpn_command=(sudo openvpn
+              --config /tmp/config.ovpn
+              --route 169.254.0.0 255.255.0.0 net_gateway
+              --script-security 2
+              --up /etc/openvpn/update-systemd-resolved --up-restart
+              --down /etc/openvpn/update-systemd-resolved --down-pre
+              --dhcp-option DOMAIN-ROUTE .)
+
+            if grep -q auth-user-pass /tmp/config.ovpn; then
+              vpn_command+=(--auth-user-pass /tmp/vpn.login)
+            fi
+
+            ET_phone_home=$(ss -Hnto state established '( sport = :ssh )' | head -n1 | awk '{ split($4, a, ":"); print a[1] }')
+            echo $ET_phone_home
+            if [ -n "$ET_phone_home" ]; then
+              vpn_command+=(--route $ET_phone_home 255.255.255.255 net_gateway)
+            fi
 
             for IP in $(host runner.circleci.com | awk '{ print $4; }')
-              do 
-                echo "route $IP 255.255.255.255 net_gateway" >> /tmp/config.ovpn
+              do
+                vpn_command+=(--route $IP 255.255.255.255 net_gateway)
                 echo $IP
             done
 
-            # This will start the connection
-            sudo openvpn3 session-start --config /tmp/config.ovpn > /tmp/openvpn.log
+            for SYS_RES_DNS in $(systemd-resolve --status | grep 'DNS Servers'|awk '{print $3}')
+              do
+                vpn_command+=(--route $SYS_RES_DNS 255.255.255.255 net_gateway)
+                echo $SYS_RES_DNS
+            done
+
+            "${vpn_command[@]}" > /tmp/openvpn.log
 
       - run:
-          name: Wait for the connection to be established and check
+          name: Wait for the connection to be established and check IP
           command: |
             counter=1
-            until sudo openvpn3 sessions-list|grep "Client connected" || [ "$counter" -ge 5 ]; do
+            until [ -f /tmp/openvpn.log ] && [ "$(grep -c "Initialization Sequence Completed" /tmp/openvpn.log)" != 0 ] || [ "$counter" -ge 5 ]; do
               ((counter++))
               echo "Attempting to connect to VPN server..."
               sleep 1;
             done
-            
-            if ( ! sudo openvpn3 sessions-list|grep "Client connected"); then
+
+            if [ ! -f /tmp/openvpn.log ] || (! grep -iq "Initialization Sequence Completed" /tmp/openvpn.log); then
               printf "\nUnable to establish connection within the allocated time ---> Giving up.\n"
             else
               printf "\nVPN connected\n"
-              printf "\nPublic IP is now %s\n" "$(curl -s https://checkip.amazonaws.com)"
+              printf "\nPublic IP is now %s\n" "$(curl -s http://checkip.amazonaws.com)"
             fi
 
       - run:
@@ -82,7 +92,5 @@ jobs:
       - run:
           name: Disconnect from OpenVPN
           command: |
-            SESSION_PATH=$(sudo openvpn3 sessions-list | grep Path | awk -F': ' '{print $2}')
-            echo $SESSION_PATH
-            sudo openvpn3 session-manage --session-path $SESSION_PATH --disconnect
+            sudo killall openvpn || true
           when: always
